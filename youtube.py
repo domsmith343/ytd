@@ -14,6 +14,6 @@ def download_video(url, save_path):
         print(e)
         
 url = "https://youtu.be/1xCkl9ZcQp4?si=Uztp_t6PszYXS3Ly"
-save_path = "users/dom/downloads"
+save_path = "users/user/downloads"
 
 download_video(url, save_path)
