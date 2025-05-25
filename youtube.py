@@ -6,23 +6,115 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from threading import Thread
 import subprocess
-from flask import Flask, render_template, request, jsonify, send_file
+from flask import Flask, render_template, request, jsonify, send_file, session
 from werkzeug.utils import secure_filename
 import tempfile
 from datetime import datetime
 from flask_cors import CORS
 import secrets
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import re
+from functools import wraps
+import hashlib
+import magic
+import logging
+from logging.handlers import RotatingFileHandler
+import bleach
+from urllib.parse import urlparse, parse_qs
+from security_config import *
+
+# Set up logging
+logger = logging.getLogger('youtube_downloader')
+logger.setLevel(LOG_CONFIG['LEVEL'])
+handler = RotatingFileHandler(
+    os.path.join(LOG_DIR, 'youtube_downloader.log'),
+    maxBytes=LOG_CONFIG['MAX_BYTES'],
+    backupCount=LOG_CONFIG['BACKUP_COUNT']
+)
+formatter = logging.Formatter(LOG_CONFIG['FORMAT'])
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+def log_activity(activity_type, details, ip=None):
+    """Log activity with standardized format"""
+    logger.info(f"Activity: {activity_type}, IP: {ip}, Details: {details}")
+
+def validate_youtube_url(url):
+    """Enhanced YouTube URL validation and sanitization"""
+    try:
+        # Sanitize URL
+        url = bleach.clean(url)
+        parsed = urlparse(url)
+        
+        # Check domain
+        if parsed.netloc not in ['www.youtube.com', 'youtube.com', 'youtu.be']:
+            return False
+            
+        # Check path and query
+        if parsed.netloc in ['www.youtube.com', 'youtube.com']:
+            if not parsed.path == '/watch':
+                return False
+            params = parse_qs(parsed.query)
+            if 'v' not in params or not re.match(YOUTUBE_ID_PATTERN, params['v'][0]):
+                return False
+        elif parsed.netloc == 'youtu.be':
+            if not re.match(f'/{YOUTUBE_ID_PATTERN[1:-1]}$', parsed.path):
+                return False
+                
+        return True
+    except:
+        return False
+
+def validate_file_type(file_path):
+    """Validate file type using libmagic"""
+    try:
+        mime = magic.Magic(mime=True)
+        file_type = mime.from_file(file_path)
+        
+        if file_type not in ALLOWED_MIME_TYPES:
+            logger.warning(f"Invalid file type detected: {file_type} for file {file_path}")
+            return False
+            
+        return True
+    except Exception as e:
+        logger.error(f"Error validating file type: {str(e)}")
+        return False
+
+def secure_headers(response):
+    """Add security headers to response"""
+    for header, value in SECURITY_HEADERS.items():
+        response.headers[header] = value
+    return response
+
+def require_local(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if request.remote_addr not in ['127.0.0.1', 'localhost']:
+            return jsonify({'error': 'Access denied'}), 403
+        return f(*args, **kwargs)
+    return decorated_function
 
 class YouTubeDownloader:
     def __init__(self):
         self.download_path = os.path.expanduser("~/Downloads/YouTube")
         self.ensure_directory_exists(self.download_path)
         self.progress_callback = None
+        self.download_history = {}
         
     def ensure_directory_exists(self, path):
         """Create directory if it doesn't exist"""
         if not os.path.exists(path):
             os.makedirs(path)
+    
+    def log_download(self, url, result):
+        """Log download attempt"""
+        self.download_history[url] = {
+            'timestamp': datetime.now().isoformat(),
+            'success': result['success'],
+            'error': result.get('error'),
+            'file_hash': calculate_file_hash(result['video_path']) if result.get('video_path') else None
+        }
     
     def download_thumbnail(self, yt, save_path):
         """Download video thumbnail"""
@@ -119,13 +211,18 @@ class YouTubeDownloader:
             return None
     
     def download_video(self, url, save_path=None, target_resolution="1080p", download_thumbnail=True, save_metadata=True):
-        """Main download function with all features"""
-        if not save_path:
-            save_path = self.download_path
-            
-        self.ensure_directory_exists(save_path)
-        
+        """Enhanced download function with security measures"""
         try:
+            # Validate URL
+            if not validate_youtube_url(url):
+                return {'success': False, 'error': 'Invalid YouTube URL'}
+                
+            if not save_path:
+                save_path = self.download_path
+                
+            self.ensure_directory_exists(save_path)
+            
+            # Initialize YouTube object
             yt = YouTube(url, on_progress_callback=self.progress_function)
             
             # Download thumbnail
@@ -141,11 +238,12 @@ class YouTubeDownloader:
             # Download video with resume capability
             video_path = self.resume_download(url, save_path, target_resolution)
             
-            # Convert to MP4 if needed (using ffmpeg)
+            # Convert to MP4 if needed
             if video_path and not video_path.endswith('.mp4'):
                 video_path = self.convert_to_mp4(video_path)
             
-            return {
+            # Validate downloaded files
+            result = {
                 'success': True,
                 'video_path': video_path,
                 'thumbnail_path': thumbnail_path,
@@ -153,12 +251,24 @@ class YouTubeDownloader:
                 'title': yt.title
             }
             
+            for key in ['video_path', 'thumbnail_path', 'metadata_path']:
+                if result.get(key) and not validate_file_type(result[key]):
+                    # Clean up invalid files
+                    try:
+                        os.remove(result[key])
+                    except:
+                        pass
+                    return {'success': False, 'error': f'Invalid file type detected for {key}'}
+            
+            # Log successful download
+            self.log_download(url, result)
+            
+            return result
+            
         except Exception as e:
-            return {
-                'success': False,
-                'error': str(e)
-            }
-    
+            logger.error(f"Download error: {str(e)}")
+            return {'success': False, 'error': str(e)}
+
     def convert_to_mp4(self, input_path):
         """Convert video to MP4 using ffmpeg"""
         try:
@@ -172,6 +282,18 @@ class YouTubeDownloader:
         except Exception as e:
             print(f"Conversion error: {e}")
             return input_path
+
+def calculate_file_hash(file_path):
+    """Calculate SHA-256 hash of file"""
+    try:
+        sha256_hash = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+    except Exception as e:
+        logger.error(f"Error calculating file hash: {str(e)}")
+        return None
 
 # GUI Application
 class YouTubeDownloaderGUI:
@@ -292,39 +414,85 @@ class YouTubeDownloaderGUI:
 
 # Flask Web Interface
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
-app.config['SECRET_KEY'] = 'your-secret-key-here'  # Add a secret key
-app.config['SESSION_COOKIE_SECURE'] = False  # Allow non-HTTPS cookies
-app.config['SESSION_COOKIE_HTTPONLY'] = True
+CORS(app, 
+     resources={r"/*": {
+         "origins": CORS_ORIGINS,
+         "methods": CORS_METHODS,
+         "allow_headers": CORS_ALLOWED_HEADERS,
+         "max_age": CORS_MAX_AGE
+     }}
+)
+
+# Security configurations
+app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', secrets.token_hex(32))
+app.config['SESSION_COOKIE_SECURE'] = SESSION_COOKIE_SECURE
+app.config['SESSION_COOKIE_HTTPONLY'] = SESSION_COOKIE_HTTPONLY
+app.config['SESSION_COOKIE_SAMESITE'] = SESSION_COOKIE_SAMESITE
+app.config['PERMANENT_SESSION_LIFETIME'] = SESSION_LIFETIME
+app.config['MAX_CONTENT_LENGTH'] = MAX_REQUEST_SIZE
+
+# Initialize rate limiter
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=[RATE_LIMITS['DEFAULT']],
+    storage_uri="memory://"
+)
+
+# Initialize downloader instance
 downloader_instance = YouTubeDownloader()
 
+@app.before_request
+def before_request():
+    """Pre-request security checks"""
+    # Ensure session has CSRF token
+    if 'csrf_token' not in session:
+        session['csrf_token'] = secrets.token_hex(32)
+    
+    # Validate CSRF token for POST requests
+    if request.method == 'POST':
+        token = request.headers.get('X-CSRF-Token')
+        if not token or token != session['csrf_token']:
+            log_activity('CSRF_VIOLATION', {'ip': request.remote_addr})
+            return jsonify({'error': 'Invalid CSRF token'}), 403
+
+@app.after_request
+def after_request(response):
+    """Post-request security measures"""
+    return secure_headers(response)
+
 @app.route('/')
+@require_local
 def index():
-    return '''
+    """Serve the main page with enhanced security"""
+    csrf_token = session['csrf_token']
+    return f'''
     <!DOCTYPE html>
     <html>
     <head>
         <title>YouTube Downloader Web</title>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta http-equiv="Content-Security-Policy" content="{SECURITY_HEADERS['Content-Security-Policy']}">
         <style>
-            body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
-            .container { background: #f5f5f5; padding: 20px; border-radius: 10px; }
-            input, select, button { padding: 10px; margin: 5px; border: 1px solid #ddd; border-radius: 5px; }
-            input[type="text"] { width: 70%; }
-            button { background: #007bff; color: white; cursor: pointer; }
-            button:hover { background: #0056b3; }
-            .progress { width: 100%; height: 20px; background: #ddd; border-radius: 10px; margin: 10px 0; }
-            .progress-bar { height: 100%; background: #007bff; border-radius: 10px; width: 0%; }
-            .status { margin: 10px 0; padding: 10px; background: #e7f3ff; border-radius: 5px; }
-            .options { margin: 10px 0; }
-            .checkbox { margin: 10px 0; }
+            body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }}
+            .container {{ background: #f5f5f5; padding: 20px; border-radius: 10px; }}
+            input, select, button {{ padding: 10px; margin: 5px; border: 1px solid #ddd; border-radius: 5px; }}
+            input[type="text"] {{ width: 70%; }}
+            button {{ background: #007bff; color: white; cursor: pointer; }}
+            button:hover {{ background: #0056b3; }}
+            .progress {{ width: 100%; height: 20px; background: #ddd; border-radius: 10px; margin: 10px 0; }}
+            .progress-bar {{ height: 100%; background: #007bff; border-radius: 10px; width: 0%; }}
+            .status {{ margin: 10px 0; padding: 10px; background: #e7f3ff; border-radius: 5px; }}
+            .options {{ margin: 10px 0; }}
+            .checkbox {{ margin: 10px 0; }}
         </style>
     </head>
     <body>
         <div class="container">
             <h1>YouTube Downloader Pro</h1>
             <form id="downloadForm">
+                <input type="hidden" id="csrf_token" value="{csrf_token}">
                 <div>
                     <input type="text" id="url" placeholder="Enter YouTube URL" required>
                     <button type="submit">Download</button>
@@ -363,40 +531,42 @@ def index():
         </div>
 
         <script>
-            document.getElementById('downloadForm').addEventListener('submit', function(e) {
+            document.getElementById('downloadForm').addEventListener('submit', function(e) {{
                 e.preventDefault();
                 
                 const url = document.getElementById('url').value;
                 const resolution = document.getElementById('resolution').value;
                 const thumbnail = document.getElementById('thumbnail').checked;
                 const metadata = document.getElementById('metadata').checked;
+                const csrf_token = document.getElementById('csrf_token').value;
                 
-                if (!url) {
+                if (!url) {{
                     alert('Please enter a YouTube URL');
                     return;
-                }
+                }}
                 
                 // Show progress
                 document.getElementById('progressContainer').style.display = 'block';
                 document.getElementById('status').style.display = 'block';
                 document.getElementById('status').textContent = 'Starting download...';
                 
-                // Send request
-                fetch('/download', {
+                // Send request with CSRF token
+                fetch('/download', {{
                     method: 'POST',
-                    headers: {
+                    headers: {{
                         'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
+                        'X-CSRF-Token': csrf_token
+                    }},
+                    body: JSON.stringify({{
                         url: url,
                         resolution: resolution,
                         thumbnail: thumbnail,
                         metadata: metadata
-                    })
-                })
+                    }})
+                }})
                 .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
+                .then(data => {{
+                    if (data.success) {{
                         document.getElementById('status').textContent = 'Download completed: ' + data.title;
                         document.getElementById('result').innerHTML = 
                             '<h3>Download Successful!</h3>' +
@@ -404,52 +574,180 @@ def index():
                             '<p><strong>Video:</strong> <a href="/download_file?path=' + encodeURIComponent(data.video_path) + '">Download Video</a></p>' +
                             (data.thumbnail_path ? '<p><strong>Thumbnail:</strong> <a href="/download_file?path=' + encodeURIComponent(data.thumbnail_path) + '">Download Thumbnail</a></p>' : '') +
                             (data.metadata_path ? '<p><strong>Metadata:</strong> <a href="/download_file?path=' + encodeURIComponent(data.metadata_path) + '">Download Metadata</a></p>' : '');
-                    } else {
+                    }} else {{
                         document.getElementById('status').textContent = 'Error: ' + data.error;
                         document.getElementById('result').innerHTML = '<p style="color: red;">Download failed: ' + data.error + '</p>';
-                    }
+                    }}
                     document.getElementById('progressBar').style.width = '100%';
-                })
-                .catch(error => {
+                }})
+                .catch(error => {{
                     document.getElementById('status').textContent = 'Error: ' + error.message;
                     document.getElementById('result').innerHTML = '<p style="color: red;">Download failed: ' + error.message + '</p>';
-                });
-            });
+                }});
+            }});
         </script>
     </body>
     </html>
     '''
 
 @app.route('/download', methods=['POST'])
+@require_local
+@limiter.limit(RATE_LIMITS['DOWNLOAD'])
 def download():
-    data = request.json
-    url = data.get('url')
-    resolution = data.get('resolution', '1080p')
-    download_thumbnail = data.get('thumbnail', True)
-    save_metadata = data.get('metadata', True)
-    
-    if not url:
-        return jsonify({'success': False, 'error': 'No URL provided'})
-    
-    # Use temporary directory for web downloads
-    temp_dir = tempfile.mkdtemp()
-    
-    result = downloader_instance.download_video(
-        url=url,
-        save_path=temp_dir,
-        target_resolution=resolution,
-        download_thumbnail=download_thumbnail,
-        save_metadata=save_metadata
-    )
-    
-    return jsonify(result)
+    """Enhanced download endpoint with security measures"""
+    try:
+        data = request.get_json()
+        if not data:
+            log_activity('INVALID_REQUEST', {'ip': request.remote_addr, 'error': 'Invalid JSON data'})
+            return jsonify({'success': False, 'error': 'Invalid JSON data'}), 400
+
+        url = data.get('url')
+        if not url or not validate_youtube_url(url):
+            log_activity('INVALID_URL', {'ip': request.remote_addr, 'url': url})
+            return jsonify({'success': False, 'error': 'Invalid YouTube URL'}), 400
+
+        resolution = data.get('resolution', '1080p')
+        if resolution not in ALLOWED_RESOLUTIONS:
+            log_activity('INVALID_RESOLUTION', {'ip': request.remote_addr, 'resolution': resolution})
+            return jsonify({'success': False, 'error': 'Invalid resolution'}), 400
+
+        download_thumbnail = bool(data.get('thumbnail', True))
+        save_metadata = bool(data.get('metadata', True))
+        
+        # Use temporary directory for web downloads
+        temp_dir = tempfile.mkdtemp(prefix=TEMP_FILE_PREFIX)
+        
+        try:
+            result = downloader_instance.download_video(
+                url=url,
+                save_path=temp_dir,
+                target_resolution=resolution,
+                download_thumbnail=download_thumbnail,
+                save_metadata=save_metadata
+            )
+            
+            if not result['success']:
+                log_activity('DOWNLOAD_FAILED', {
+                    'ip': request.remote_addr,
+                    'url': url,
+                    'error': result['error']
+                })
+                return jsonify(result), 400
+                
+            # Validate file paths and sizes
+            for key in ['video_path', 'thumbnail_path', 'metadata_path']:
+                if result.get(key):
+                    file_path = os.path.abspath(result[key])
+                    if not file_path.startswith(os.path.abspath(temp_dir)):
+                        log_activity('PATH_TRAVERSAL_ATTEMPT', {
+                            'ip': request.remote_addr,
+                            'path': file_path
+                        })
+                        return jsonify({'success': False, 'error': 'Invalid file path'}), 400
+                        
+                    if os.path.getsize(file_path) > MAX_FILE_SIZE:
+                        log_activity('FILE_SIZE_EXCEEDED', {
+                            'ip': request.remote_addr,
+                            'path': file_path,
+                            'size': os.path.getsize(file_path)
+                        })
+                        return jsonify({'success': False, 'error': 'File too large'}), 400
+                    
+            log_activity('DOWNLOAD_SUCCESS', {
+                'ip': request.remote_addr,
+                'url': url,
+                'title': result.get('title')
+            })
+            return jsonify(result)
+            
+        finally:
+            # Clean up temporary directory after some time
+            def cleanup():
+                import time
+                time.sleep(TEMP_FILE_LIFETIME)
+                try:
+                    import shutil
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                except Exception as e:
+                    logger.error(f"Error cleaning up temp directory: {str(e)}")
+            
+            cleanup_thread = Thread(target=cleanup)
+            cleanup_thread.daemon = True
+            cleanup_thread.start()
+            
+    except Exception as e:
+        logger.error(f"Download endpoint error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/download_file')
+@require_local
+@limiter.limit(RATE_LIMITS['FILE_RETRIEVAL'])
 def download_file():
-    file_path = request.args.get('path')
-    if file_path and os.path.exists(file_path):
-        return send_file(file_path, as_attachment=True)
-    return "File not found", 404
+    """Enhanced file download endpoint with security measures"""
+    try:
+        file_path = request.args.get('path')
+        if not file_path:
+            log_activity('MISSING_FILE_PATH', {'ip': request.remote_addr})
+            return "No file specified", 400
+            
+        # Validate file path
+        abs_path = os.path.abspath(file_path)
+        if not abs_path.startswith(tempfile.gettempdir()):
+            log_activity('PATH_TRAVERSAL_ATTEMPT', {
+                'ip': request.remote_addr,
+                'path': file_path
+            })
+            return "Access denied", 403
+            
+        if not os.path.exists(abs_path):
+            log_activity('FILE_NOT_FOUND', {
+                'ip': request.remote_addr,
+                'path': file_path
+            })
+            return "File not found", 404
+            
+        # Validate file size
+        if os.path.getsize(abs_path) > MAX_FILE_SIZE:
+            log_activity('FILE_SIZE_EXCEEDED', {
+                'ip': request.remote_addr,
+                'path': file_path,
+                'size': os.path.getsize(abs_path)
+            })
+            return "File too large", 400
+            
+        # Validate file type
+        if not validate_file_type(abs_path):
+            log_activity('INVALID_FILE_TYPE', {
+                'ip': request.remote_addr,
+                'path': file_path
+            })
+            return "Invalid file type", 400
+            
+        log_activity('FILE_DOWNLOAD', {
+            'ip': request.remote_addr,
+            'path': file_path
+        })
+        return send_file(abs_path, as_attachment=True)
+        
+    except Exception as e:
+        logger.error(f"File download error: {str(e)}")
+        return str(e), 500
+
+# Error handlers
+@app.errorhandler(404)
+def not_found(e):
+    log_activity('NOT_FOUND', {'ip': request.remote_addr, 'path': request.path})
+    return jsonify({'error': 'Not found'}), 404
+
+@app.errorhandler(500)
+def server_error(e):
+    log_activity('SERVER_ERROR', {'ip': request.remote_addr, 'error': str(e)})
+    return jsonify({'error': 'Internal server error'}), 500
+
+@app.errorhandler(429)
+def ratelimit_handler(e):
+    log_activity('RATE_LIMIT_EXCEEDED', {'ip': request.remote_addr, 'limit': str(e.description)})
+    return jsonify({'error': f"Rate limit exceeded. {e.description}"}), 429
 
 # Main execution
 if __name__ == "__main__":

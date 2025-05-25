@@ -38,6 +38,19 @@ env/
 *.json
 .env
 *.log
+logs/
+temp/
+downloads/
+
+# Security
+*.key
+*.pem
+*.crt
+*.cer
+*.p12
+*.pfx
+.secret*
+security_config_prod.py
 
 # macOS
 .DS_Store
